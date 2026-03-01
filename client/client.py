@@ -92,9 +92,7 @@ def send_request(payload: dict, timeout_s=10):
 # ==================================================
 
 def derive_key(password, salt):
-    return PBKDF2(password, salt, dkLen=32,
-                  count=PBKDF2_ITERS,
-                  hmac_hash_module=SHA256)
+    return PBKDF2(password, salt, dkLen=32,count=PBKDF2_ITERS,hmac_hash_module=SHA256)
 
 
 def encrypt_private_key(private_pem, password):
@@ -250,8 +248,7 @@ def upload():
         wrapped = PKCS1_OAEP.new(pub, hashAlgo=SHA256).encrypt(file_key)
         acl[user] = b64e(wrapped)
 
-    signature = sign_blob(CURRENT_PRIVATE_KEY,
-                          ciphertext + nonce + tag)
+    signature = sign_blob(CURRENT_PRIVATE_KEY,ciphertext + nonce + tag)
 
     resp = send_request({
         "action": "upload",
@@ -317,9 +314,7 @@ def download():
 
     owner_pub = RSA.import_key(owner_key_resp["keys"][owner])
 
-    if not verify_blob(owner_pub,
-                       ciphertext + nonce + tag,
-                       signature):
+    if not verify_blob(owner_pub,ciphertext + nonce + tag,signature):
         print("Signature invalid.")
         return
 
