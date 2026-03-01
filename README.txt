@@ -1,4 +1,5 @@
-run server.py then client.py, both files are insidei respective folders
+run server.py then client.py, both files are inside respective folders
+
 
 Users and passwds
 kenny -> kenny123
