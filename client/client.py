@@ -17,6 +17,11 @@ import time
 import uuid
 from getpass import getpass
 from pathlib import Path
+import os
+import subprocess
+import tempfile
+import platform
+import shutil
 
 from Crypto.Cipher import AES, PKCS1_OAEP
 from Crypto.Hash import SHA256
@@ -289,6 +294,10 @@ def decrypt_file_from_download(download_response: dict):
     if not verify_blob(signer_public, payload, signature):
         raise Exception("Signature invalid")
 
+    # Ensure current user has access in ACL
+    if "acl" not in meta or CURRENT_USER not in meta["acl"]:
+        raise Exception("Access denied: your user is not in the file ACL")
+
     wrapped_key = b64d(meta["acl"][CURRENT_USER])
     file_key = PKCS1_OAEP.new(CURRENT_PRIVATE_KEY, hashAlgo=SHA256).decrypt(wrapped_key)
 
@@ -455,21 +464,83 @@ def modify_file():
         return
 
     try:
-        _, file_key, meta = decrypt_file_from_download(download_response)
+        plaintext, file_key, meta = decrypt_file_from_download(download_response)
     except Exception as exc:
         print("Cannot modify file:", exc)
         return
 
-    edited_path_input = input("Path to edited plaintext file: ").strip()
-    edited_path = Path(edited_path_input)
+    # Write plaintext to a temporary file for user to edit in-place
+    tmp = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{meta['filename']}")
+        tmp_path = Path(tmp.name)
+        tmp.write(plaintext)
+        tmp.close()
 
-    if not edited_path.exists():
-        print("Edited file not found.")
-        return
+        # Offer inline edit in the same terminal if the file is text
+        new_plaintext = None
+        is_text = True
+        try:
+            plaintext.decode('utf-8')
+        except Exception:
+            is_text = False
 
-    new_plaintext = edited_path.read_bytes()
+        choice = None
+        if is_text:
+            choice = input("Edit inline in terminal? (y/N): ").strip().lower()
+            if choice == 'y':
+                print("Current file content:\n---- START FILE ----")
+                try:
+                    print(plaintext.decode('utf-8'))
+                except Exception:
+                    print(plaintext.decode('utf-8', errors='replace'))
+                print("---- END FILE ----\n")
+                print("Enter the new file content. End with a line containing only .END")
+                lines = []
+                while True:
+                    try:
+                        line = input()
+                    except EOFError:
+                        break
+                    if line == '.END':
+                        break
+                    lines.append(line)
+
+                new_plaintext = "\n".join(lines).encode('utf-8')
+
+        # If not using inline mode, fall back to opening external editor
+        if new_plaintext is None:
+            # If user explicitly declined inline edit on a text file, force nano
+            if is_text and choice is not None and choice != 'y':
+                editor = 'nano'
+            else:
+                editor = os.environ.get('EDITOR', 'nano')
+
+            try:
+                subprocess.run([editor, str(tmp_path)])
+            except FileNotFoundError:
+                print(f"Editor '{editor}' not found. Skipping interactive edit.")
+
+            new_plaintext = tmp_path.read_bytes()
+    finally:
+        # remove temp file if it exists
+        if tmp is not None:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
     new_ciphertext, new_nonce, new_tag = encrypt_with_key(new_plaintext, file_key)
     new_signature = sign_blob(CURRENT_PRIVATE_KEY, new_ciphertext + new_nonce + new_tag)
+
+    # Sanity-check signature locally before sending
+    try:
+        pub = CURRENT_PRIVATE_KEY.publickey()
+        if not verify_blob(pub, new_ciphertext + new_nonce + new_tag, new_signature):
+            print("Local signature verification failed. Aborting update.")
+            return
+    except Exception as exc:
+        print("Signature verification error:", exc)
+        return
 
     response = send_request(
         with_session(
@@ -529,13 +600,45 @@ def update_acl():
         return
 
     meta = download_response["meta"]
-    current_acl = set(meta["acl"].keys())
+    current_acl_all = set(meta["acl"].keys())
+    owner_name = meta.get("owner")
+    # Do not display the owner in the ACL listing (owner is always preserved)
+    current_acl = current_acl_all - {owner_name} if owner_name else current_acl_all
 
-    print("\nCurrent ACL:", ", ".join(sorted(current_acl)))
+    if current_acl:
+        print("\nCurrent ACL (excluding owner):", ", ".join(sorted(current_acl)))
+    else:
+        print("\nCurrent ACL (excluding owner): (none)")
 
-    new_acl_input = input("New ACL (comma-separated): ").strip()
-    recipients = {user.strip() for user in new_acl_input.split(",") if user.strip()}
+    # Let the owner choose to add, remove, or replace ACL entries
+    action = input("ACL action - add (1), remove (2), cancel (0): ").strip().lower()
+    if action == "0":
+        return
+
+    if action == '1': 
+        add_input = input("Users to add (comma-separated): ").strip()
+        add_set = {u.strip() for u in add_input.split(",") if u.strip()}
+        recipients = set(current_acl) | add_set
+
+    elif action == '2':
+        rem_input = input("Users to remove (comma-separated): ").strip()
+        rem_set = {u.strip() for u in rem_input.split(",") if u.strip()}
+        
+        # Warn if attempting to remove users not in ACL
+        not_in_acl = rem_set - current_acl
+        if not_in_acl:
+            print("These users are not in the ACL and will be ignored:", ", ".join(sorted(not_in_acl)))
+        recipients = set(current_acl) - rem_set
+    else:
+        print("Invalid action.")
+        return
+
+    # Ensure owner remains in ACL
     recipients.add(CURRENT_USER)
+
+    if not recipients:
+        print("ACL would be empty; aborting.")
+        return
 
     key_response = send_request(
         {
